@@ -8,13 +8,33 @@
 ;
 ; === NOTES:
 ; - EEPROM has I2C address 0x51 on EasyAVR.
-; - All commands should support output to string instead of variable
+; - ALL commands should support output directly to UART instead of variable
 ;   ("var=comm(arg)" vs "=comm(arg)").
-; - Only variables can serve as arguments (no immediate arguments).
-; - Only symbols with code>=32 can be used in variables and operations
+; - ONLY variables can serve as arguments (no immediate arguments).
+; - ONLY chars with value>=32 can be used in variables and operations
 ; - Rules for string variables also apply to variable names.
-; - EEPROM format: [var_name21bits][var_value21bits].
-; - Use RAM as transmit buffer, reset pointer on TXC.
+; - Two buffers in SRAM are used to store current operation OR result
+; - CRLF for line breaks expected in UART_RECV
+;
+; === EEPROM format:
+;	B0:0x00: A
+;	B0:0x04: B
+;	B0:0x08: C
+;
+;	B0:0x0C: x
+;	B0:0x21: y
+;	B0:0x36: z
+;
+; === INT VARS:
+; - Allowed names: {A, B, C}
+; - Allowed value range: 0-99999999 (8 digits, unsigned)
+; - Write examples: "A=0", "B=12345678".
+;
+; === STR VARS:
+; - Allowed names: {x, y, z}
+; - Allowed values: >=32
+; - Allowed length: 20 symbols (w/o '\0')
+; - Write examples: "x=123", "y=y //~asdASD000", "z=1234567890ABCDEFGHIJ"
 ;
 ; === OPERATIONS:
 ; - x=find(s1,s2)
@@ -44,124 +64,214 @@
 ; - freq = 100 kHz
 ;
 ; === AVAILABLE ACTIONS:
-; 1. Input from PC terminal via UART, save to EEPROM via I2C.
-; 1.1. input string variables: {x, y, z}. Input string contains 
+; 1. Input from PC terminal via UART, save to external EEPROM via I2C.
+; 1.1. input string variable: {x, y, z}. Input string contains 
 ;      ASCII-codes (>=32), strlen <= 20;
 ;      Query format: "variable_name=value"
-; 1.2. input 8-bit non-negative int variables {A, B, C};
+; 1.2. input 8-digit unsigned int variable {A, B, C};
 ;      Query format: "integer_name=value"
-; 2. Output to PC terminal via UART, take values from EEPROM via I2C.
-; 2.1. output values of integer and (!) string variables;
+; 2. Output to PC terminal via UART, take value from EEPROM via I2C.
+; 2.1. output value of requested integer or string variable;
 ;      Query format: "=variable_name"
 ; 2.2. output result of operation with string variables, values used for 
 ;      operation are taken from EEPROM immediately before operation execution;
 ;      Query format: "=command_name(args)"
 ; 3. Execute operation with string variables, values of used integer and string
-;    variables are taken from EEPROM (SAVE RESULT TO VAR???).
+;    variables are taken from EEPROM.
 ;    Query format: "variable_name=command_name(args)"
 ;    IMPORTANT: Only variables can serve as arguments.
+;
+; === STATR:
+; - SROF (Bit 1) --- Operation Pending Flag (ignore input, process op if set)
+; - SRSF (Bit 0) --- UART Send Pending Flag (ignore input, send result if set)
+;
+; === SRAM BUFFERS:
+; - Operation buffer:
+;	- Should have enough space for longest OP --- writing string to variable
+;		1  byte  --- var_name
+;		1  byte  --- '=' char
+;		20 bytes --- var_value
+;			CRLF IS NOT STORED!!
+;		1  byte  --- '\0' char
+;		TOTAL: 23 bytes
+; - Send buffer:
+;	- Size: 23 bytes (string + CRLF + '\0')
+;	- CRLF is stored in buffer --- no extra operations required before sending
 ;===============================================================================
 
 
-.def TMP = R20
-.def SMP = R21
+; === USED REGISTERS
+; ZH, ZL, YH, YL
+.def TMP   = R20	; main temp register
+.def SMP   = R21	; secondary temp register
 
-.def MULRL = R0
-.def MULRH = R1
+.def MULRL = R0		; MUL writes low to R0
+.def MULRH = R1		; ...and high to R1
 
+.def TBB   = R2		; temp byte buffer (for UART and TWI)
 
-.equ F_CPU = 8000000
-.equ BAUD = 57600
+.def STATR = R16	; state register
+
+; === BUFFER SIZES
+.equ OBLEN = 23
+.equ SBLEN = 23
+.equ IVLEN = 4	; (fixed size, not terminated)
+.equ SVLEN = 21 ; (20 chars + '\0')
+
+; === SRAM POINTERS
+.equ OBPTR = SRAM_START
+.equ SBPTR = OBPTR + OBLEN
+
+; === EEPROM POINTERS
+.equ IVPTR = 0x00
+.equ SVPTR = IVPTR + (IVLEN * 3) ; var amt is hardcoded
+
+; === UART PARAMS
+.equ F_CPU	  = 8000000
+.equ BAUD	  = 57600
 .equ UBRR_VAL = (F_CPU / (16 * BAUD)) - 1
+
+; === STATR BITS
+.equ SROF = 1 ; OP Flag
+.equ SRSF = 0 ; SP Flag
+
+
+; OUTs VAL to PORT via TMP
+.macro OUTI;(iop PORT, int VAL)
+	LDI TMP, @1
+	OUT @0, TMP
+.endm
+
+
+; saves SREG and TMP to stack
+.macro ISRB
+	PUSH TMP
+	IN TMP, SREG
+	PUSH TMP
+.endm
+
+
+; restores SREG and TMP, returns from ISR
+.macro ISRE
+	POP TMP
+	OUT SREG, TMP
+	POP TMP
+	RETI
+.endm
 
 
 .org 0x00
 	JMP RESET
-.org 0x1A
-	JMP UART_RXC_ISR
-.org 0x1C
-	JMP UART_UDRE_ISR
-.org 0x1E
-	JMP UART_TXC_ISR
-.org 0x26
-	JMP TWI_ISR
+.org URXCaddr
+	JMP URXCisr
+.org UDREaddr
+	JMP UDREisr
+.org TWIaddr
+	JMP TWIisr
 
 
 RESET:
 ; stack setup
-	LDI TMP, HIGH(RAMEND)
-	OUT SPH, TMP
-	LDI TMP, LOW(RAMEND)
-	OUT SPL, TMP
+	OUTI SPH, HIGH(RAMEND)
+	OUTI SPL, LOW(RAMEND)
 
 ; uart setup
-	LDI TMP, HIGH(UBRR_VAL)
-	OUT UBRRH, TMP
-	LDI TMP, LOW(UBRR_VAL)
-	OUT UBRRL, TMP
+	OUTI UBRRH, HIGH(UBRR_VAL)
+	OUTI UBRRL, LOW(UBRR_VAL)
 	
-	LDI TMP, (1 << RXCIE) | (1 << TXCIE) | (1 << UDRIE) | (1 << RXEN) \
-						  | (1 << TXEN)
-	OUT UCSRB, TMP
+	OUTI UCSRB, (1 << RXCIE) | (1 << UDRIE) | (1 << RXEN) | (1 << TXEN)
 
-	LDI TMP, (1 << URSEL) | (1 << UPM1) | (1 << UCSZ1) | (1 << UCSZ0)
-	OUT UCSRC, TMP
+	OUTI UCSRC, (1 << URSEL) | (1 << UPM1) | (1 << UCSZ1) | (1 << UCSZ0)
 
 ; twi setup
-	LDI TMP, 32
-	OUT TWBR, TMP
+	OUTI TWBR, 32	; division factor = 32
 
-	LDI TMP, (1 << TWEN) | (1 << TWIE)
-	OUT TWCR, TMP
+	OUTI TWCR, (1 << TWEN) | (1 << TWIE)
 
 	; TWSR unused
 	; TWAR unused
 	
 ; misc setup
-	CLR ZH
-	CLR ZL
+	LDI YH, HIGH(OBPTR)
+	LDI YL, LOW(OBPTR)
+
+	LDI ZH, HIGH(SBPTR)
+	LDI ZL, LOW(SBPTR)
+
+	CLR TBB
+	CLR STATR
 
 ; interrupt setup
+	; individual interrupts enabled in uart, twi setup
+
 	SEI
 
 
 LOOP:
-	NOP
+	NOP	; TODO: process operations
 
 	RJMP LOOP
 
 
-UART_RXC_ISR:
-	PUSH SREG
+; schedules (starts) send via UART
+SCHEDULE_SEND:
+	; reset pointer
+	LDI ZH, HIGH(SBPTR)
+	LDI ZL, LOW(SBPTR)
+
+	; set flag
+	SBR STATR, SRSF
+
+	; pre-send check
+SCHEDULE_SEND_chkl:
+	SBIS UCSRA, UDRE
+	RJMP SCHEDULE_SEND_chkl
+
+	; first send
+	CALL UART_SEND
+
+	RET
+
+
+; sends from SEND BUFFER via UART (UNSAFE, CALL FROM ISR! ...or check UDRE)
+UART_SEND:
+	OUT UDR, TMP
+
+	RET	; TODO: process send
+
+
+; receives UART to OP BUFFER (UNSAFE, CALL FROM ISR!)
+UART_RECV:
+	IN TMP, UDR
+
+	RET	; TODO: process recv
+
+
+; byte received
+URXCisr:
+	ISRB
 
 	NOP
 
-	POP SREG
-	RETI
+URXCisrE:
+	ISRE
 
 
-UART_UDRE_ISR:
-	PUSH SREG
+; UDR is empty, another byte can be sent
+UDREisr:
+	ISRB
 	
 	NOP
 
-	POP SREG
-	RETI
+UDREisrE:
+	ISRE
 
 
-UART_TXC_ISR:
-	PUSH SREG
-	
-	NOP
-
-	POP SREG
-	RETI
-
-
-TWI_ISR:
-	PUSH SREG
+; TWI operation complete
+TWIisr:
+	ISRB
 
 	NOP
 
-	POP SREG
-	RETI
+TWIisrE:
+	ISRE
