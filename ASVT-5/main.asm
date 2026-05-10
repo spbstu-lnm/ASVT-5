@@ -7,9 +7,9 @@
 ;
 ; Lab 5.10. (a & b ONLY)
 ; String processing.
-;	v0.1.0
+;	v0.1.2
 ;
-; ==== SOFTWARE:
+; === SOFTWARE:
 ; - AVR ASM 2 
 ; - Atmel Studio 
 ; - AVRFlash
@@ -152,8 +152,12 @@
 ;	- Not terminated with '\0' (look for LF instead)
 ;	- CRLF is stored in buffer --- no extra operations required before sending
 ;
+; === Changelog:
+; - Added fix for baud rate, testing required
+; - Implemented ACK Poll
 ;
 ;===============================================================================
+
 
 ; USED REGISTERS	============================================================
 
@@ -173,6 +177,7 @@
 .def TGTSEL = R19	; target selector
 ; TMP and SMP
 .def SRCSEL = R22	; source selector
+
 .def CNT    = R23
 .def IDX    = R24
 .def ARG    = R25
@@ -202,7 +207,13 @@
 ; === UART PARAMS
 .equ F_CPU	  = 8000000
 .equ BAUD	  = 57600
-.equ UBRR_VAL = (F_CPU / (16 * BAUD)) - 1
+
+;	Note on UBRR_VAL formula changes:
+;	Several changes were made to improve baud rate accuracy
+;	- Multiplier changed 16 --> 8
+;	- U2X enabled in UCSRA
+
+.equ UBRR_VAL = (F_CPU / (8 * BAUD)) - 1
 
 ; === STATR BITS
 ; Bits 7--4 --- reserved
@@ -253,16 +264,13 @@
 	JMP RESET	; Reset Handler
 .org URXCaddr
 	JMP URXCisr	; USART RX Complete Handler
-.org UDREaddr
-	JMP UDREisr	; UDR Empty Handler
-.org TWIaddr
-	JMP TWIisr	; Two-wire Serial Interface Handler
 
 
 ; RESET AND LOOP	============================================================
 
 
-; init and send greet message
+; init interfaces (UART, TWI), stack and registers
+; print greet message to terminal
 RESET:
 	; = stack setup
 	OUTI SPH, HIGH(RAMEND)
@@ -271,6 +279,9 @@ RESET:
 	; = uart setup
 	OUTI UBRRH, HIGH(UBRR_VAL)
 	OUTI UBRRL, LOW(UBRR_VAL)
+
+	; part of baud rate fix
+	OUTI UCSRA, (1 << U2X)
 	
 	OUTI UCSRB, (1 << RXCIE) | (1 << RXEN) | (1 << TXEN)
 
@@ -321,6 +332,8 @@ RESET:
 
 
 ; main loop (processes operations)
+; waits for SROF (Operation Flag) to be set and calls parser
+; depending on OPSEL (Operation Selector) register calls correct handler
 LOOP:
 	SBRC STATR, SREF
 	CALL OP_FAIL
@@ -390,6 +403,8 @@ LOOP_STRCAT:
 ; OPERATIONS HANDLERS	========================================================
 
 
+; saves int var to EEPROM
+; parses string to BCD format and sends "OK"
 SAVE_INT_HANDLE:
 	; move ptr to start of value
 	CALL OBUF_VALUE_PTR
@@ -406,7 +421,8 @@ SAVE_INT_HANDLE:
 
 	RET
 
-
+; saves string var to EEPROM
+; writes up to 20 symbols from UART buffer, appending '\0'
 SAVE_STR_HANDLE:
 	CALL OBUF_VALUE_PTR
 	CALL SEL_ADDR_DST
@@ -440,6 +456,8 @@ SAVE_STR_ZERO:
 	RET
 
 
+; reads int var from EEPROM
+; loads BCD value, converts to string and prepares to send via UART
 LOAD_INT_HANDLE:
 	MOV TMP, TGTSEL
 	CALL SEL_ADDR
@@ -451,6 +469,8 @@ LOAD_INT_HANDLE:
 	RET
 
 
+; loads string var from EEPROM
+; copies null-terminated string to SBUF and starts send
 LOAD_STR_HANDLE:
 	MOV TMP, TGTSEL
 	CALL LOAD_STR_TO_SEND
@@ -459,7 +479,9 @@ LOAD_STR_HANDLE:
 	RET
 
 
-; performs "find" operation
+; performs find(s1, s2) operation
+; looks for substring s2 (from SRCSEL) in string s1 (from TGTSEL)
+; returns index (0--19) or 0xFF, if substring is not found
 FIND_HANDLE:
 	MOV TMP, TGTSEL
 	CALL LOAD_STR_TO_OBUF
@@ -469,6 +491,7 @@ FIND_HANDLE:
 	LDI IDX, 0
 
 FIND_OUTER:
+	; init ptr to s1 with displacment IDX
 	LDI YH, HIGH(OBPTR)
 	LDI YL, LOW(OBPTR)
 	ADD YL, IDX
@@ -476,11 +499,12 @@ FIND_OUTER:
 	INC YH
 	LD TMP, Y
 	TST TMP
-	BREQ FIND_NOT_FOUND
+	BREQ FIND_NOT_FOUND	; end of s1 reached, substring not found
 
 	LDI ARG, 0
 
 FIND_INNER:
+	; read current symbol from s2
 	LDI YH, HIGH(SBPTR)
 	LDI YL, LOW(SBPTR)
 	ADD YL, ARG
@@ -488,8 +512,9 @@ FIND_INNER:
 	INC YH
 	LD SMP, Y
 	TST SMP
-	BREQ FIND_FOUND
+	BREQ FIND_FOUND	; end of s2 reached successfully (match found)
 
+	; read symbol from s1 with displacement (IDX + ARG)
 	LDI YH, HIGH(OBPTR)
 	LDI YL, LOW(OBPTR)
 	ADD YL, IDX
@@ -500,9 +525,9 @@ FIND_INNER:
 	INC YH
 	LD TMP, Y
 	TST TMP
-	BREQ FIND_NOT_FOUND
+	BREQ FIND_NOT_FOUND	; s1 ended sooner, than s2
 	CP TMP, SMP
-	BRNE FIND_NEXT
+	BRNE FIND_NEXT	; symbols didn't match --> move to next IDX
 	INC ARG
 	RJMP FIND_INNER
 
@@ -526,7 +551,9 @@ FIND_DONE:
 	RET
 
 
-; performs "xor" operation
+; performs xor(s1, x) operation
+; XORs bytes of string (from TGTSEL) with number (from SRCSEL)
+; if resulting symbol < 32, it gets replaced with space (32)
 XOR_HANDLE:
 	MOV TMP, SRCSEL
 	CALL SEL_ADDR
@@ -545,6 +572,8 @@ XOR_LOOP:
 	TST TMP
 	BREQ XOR_DONE
 	EOR TMP, TBB
+	; sanitizing: if result of EOR is a service symbol (codes 0--31)...
+	; replace it with space (32) to prevent output errors
 	CPI TMP, 32
 	BRSH XOR_STORE
 	LDI TMP, 32
@@ -562,7 +591,8 @@ XOR_DONE:
 	RET
 
 
-; performs "strcmp" operation
+; performs strcmp(s1, s2) operation
+; returns: 0x00 if s1 == s2, 0x01 if s1 > s2, 0xFF is s1 < s2
 STRCMP_HANDLE:
 	MOV TMP, TGTSEL
 	CALL LOAD_STR_TO_OBUF
@@ -603,7 +633,8 @@ STRCMP_DONE:
 	RET
 
 
-; performs "strcat" operation
+; performs strcat(s1, s2) operation
+; appends string s2 to s1. result is strictly limited to 20 symbols
 STRCAT_HANDLE:
 	MOV TMP, TGTSEL
 	CALL LOAD_STR_TO_SEND_RAW
@@ -630,7 +661,7 @@ STRCAT_APPEND:
 
 STRCAT_APPEND_LOOP:
 	CPI CNT, 20
-	BRSH STRCAT_TERM
+	BRSH STRCAT_TERM	; strict check: avoiding buffer overflow (max. 20 chars)
 	LD TMP, Y+
 	TST TMP
 	BREQ STRCAT_TERM
@@ -649,11 +680,13 @@ STRCAT_TERM:
 
 ; SUBROUTINES	================================================================
 
+
 ; = UART (USART)
 
 ; == LEVEL 1 (unsafe)
 
 
+; basic send of one byte via UART
 ; checks if send is safe and sends a single byte from TMP via UART
 UART_BYTE_SEND:
 	; pre-send check
@@ -666,6 +699,7 @@ UART_BYTE_SEND:
 	RET
 
 
+; basic receive of one byte via UART
 ; checks if recv is safe and receives UART to TMP
 UART_BYTE_RECV:
 	; pre-recv check
@@ -695,6 +729,7 @@ UART_BYTE_RECVe:
 ; == LEVEL 2 (safe)
 
 
+; sends string from SRAM via UART until LF is reached
 ; sends LF-terminated string from SRAM via UART_BYTE_SEND (no added CRLF)
 UART_SRAM_STR_SEND:
 	LD TMP, Y+
@@ -705,6 +740,7 @@ UART_SRAM_STR_SEND:
 	RET
 
 
+; sends null-terminated string from program memory (Flash) via UART
 ; sends '\0'-terminated string via UART_BYTE_SEND (no added CRLF)
 ; IMPORTANT: this subroutine sends strings from PM !!!
 UART_PM_STR_SEND:
@@ -722,6 +758,7 @@ UART_PM_STR_SENDe:
 	RET
 
 
+; sends Carriage Return and Line Feed to terminal
 ; sends CRLF via UART_BYTE_SEND
 UART_SEND_NEWLINE:
 	LDI TMP, CR
@@ -736,6 +773,7 @@ UART_SEND_NEWLINE:
 ; == LEVEL 3 (safe)
 
 
+; sets SRSF (Send Flag) and starts send of SBUF
 ; schedules (starts) send via UART
 SCHEDULE_SEND:
 	; reset pointer
@@ -751,6 +789,7 @@ SCHEDULE_SEND:
 	RET
 
 
+; wrapper for sending data from send buffer (SBPTR) via UART
 ; sends from SEND BUFFER via UART
 UART_SEND_BUF:
 	LDI YH, HIGH(SBPTR)
@@ -761,6 +800,7 @@ UART_SEND_BUF:
 	RET
 
 
+; resets pointers to receive new data to operation buffer (OBPTR)
 ; receives to OP BUFFER via UART_BYTE_RECV
 UART_RECV_BUF:
 	LDI YH, HIGH(OBPTR)
@@ -775,6 +815,7 @@ UART_RECV_BUF:
 ; = TWI
 
 
+; generates START on I2C bus
 TWI_START:
 	OUTI TWCR, (1 << TWINT) | (1 << TWSTA) | (1 << TWEN)
 TWI_STARTw:
@@ -784,11 +825,13 @@ TWI_STARTw:
 	RET
 
 
+; generates STOP on I2C bus
 TWI_STOP:
 	OUTI TWCR, (1 << TWINT) | (1 << TWSTO) | (1 << TWEN)
 	RET
 
 
+; sends one byte from TMP via I2C bus and waits for transmission to complete
 TWI_TX:
 	OUT TWDR, TMP
 	OUTI TWCR, (1 << TWINT) | (1 << TWEN)
@@ -799,6 +842,7 @@ TWI_TXw:
 	RET
 
 
+; receives byte via I2C and returns NACK (No ACKnowledgement), marking read end
 TWI_RX_NACK:
 	OUTI TWCR, (1 << TWINT) | (1 << TWEN)
 TWI_RX_NACKw:
@@ -809,14 +853,39 @@ TWI_RX_NACKw:
 	RET
 
 
-TWI_DELAY:
-	LDI CNT, 255
-TWI_DELAY_LOOP:
-	DEC CNT
-	BRNE TWI_DELAY_LOOP
+; twi delay function (old, replaced by TWI_ACK_POLL)
+;TWI_DELAY:
+;	LDI CNT, 255
+;TWI_DELAY_LOOP:
+;	DEC CNT
+;	BRNE TWI_DELAY_LOOP
+;	RET
+
+
+; waits for EEPROM (Acknowledge Polling)
+; generates cycle START --> SLA_W. if chip returns NACK 
+; (busy, internal writing), repeats cycle
+TWI_ACK_POLL:
+	CALL TWI_START
+	LDI TMP, EEPROM_W
+	CALL TWI_TX
+	
+	; read TWI status
+	IN TMP, TWSR
+	ANDI TMP, 0xF8     ; apply mask, discarding prescaler bits
+	CPI TMP, 0x18      ; 0x18 means "SLA+W transmitted, ACK received"
+	BREQ TWI_ACK_POLL_DONE
+	
+	; if NACK was received (for example, status 0x20), memory is still busy. 
+	; repeat cycle (Repeated START is generated).
+	RJMP TWI_ACK_POLL
+
+TWI_ACK_POLL_DONE:
+	CALL TWI_STOP
 	RET
 
 
+; writes one byte (from TMP) to phys address (from XL) in I2C EEPROM
 EEPROM_WRITE_BYTE:
 	PUSH TMP
 	CALL TWI_START
@@ -827,10 +896,16 @@ EEPROM_WRITE_BYTE:
 	POP TMP
 	CALL TWI_TX
 	CALL TWI_STOP
-	CALL TWI_DELAY
+	
+	;CALL TWI_DELAY
+	
+	; use Ack Polling instead of hard delay
+	CALL TWI_ACK_POLL
+
 	RET
 
 
+; reads one byte from phys address (from XL) of I2C EEPROM into TMP register
 EEPROM_READ_BYTE:
 	CALL TWI_START
 	LDI TMP, EEPROM_W
@@ -847,6 +922,7 @@ EEPROM_READ_BYTE:
 
 ; = MISC
 
+; converts ASCII-name of a variable (from TMP) to selector int value (1--6)
 ; returns variable selector in TMP: A/B/C -> 1..3, x/y/z -> 4..6, 0 on fail
 VAR_TO_SEL:
 	CPI TMP, 'A'
@@ -884,6 +960,7 @@ VAR_Z:
 	RET
 
 
+; calculates phys address in EEPROM (XL) based on selector value (from TMP)
 ; input TMP=selector, output XL=EEPROM address
 SEL_ADDR:
 	; call SEL_ADDR_STR if var is str
@@ -918,12 +995,14 @@ SEL_ADDR_STR:
 	RET
 
 
+; wrapper: gets address in EEPROM based on DSTSEL
 SEL_ADDR_DST:
 	MOV TMP, DSTSEL
 	CALL SEL_ADDR
 	RET
 
 
+; moves ptr Y to start of var val in OBUF (after '=')
 OBUF_VALUE_PTR:
 	LDI YH, HIGH(OBPTR)
 	LDI YL, LOW(OBPTR)
@@ -935,6 +1014,7 @@ OBUF_VALUE_SCAN:
 	RET
 
 
+; parses ASCII-string from OBUF to a single byte int (0--255). result in ARG
 PARSE_BYTE:
 	CLR ARG
 
@@ -957,6 +1037,7 @@ PARSE_BYTE_DONE:
 	RET
 
 
+; frees (fills with zeros) 4 bytes in SBUF to fit new BCD number
 ; free up space in SBUF for int var (4 bytes)
 BCD_CLEAR_SEND:
 	; move Z to SBUF
@@ -973,6 +1054,7 @@ BCD_CLEAR_SEND:
 	RET
 
 
+; shifts one BCD digit (nibble 0--9 from ARG) to 4-byte packed array in SBUF
 ; shift digit into bcd
 BCD_SHIFT_IN:
 	LDI ZH, HIGH(SBPTR + 3)
@@ -980,15 +1062,21 @@ BCD_SHIFT_IN:
 
 BCD_SHIFT_LOOP:
 	LD SMP, Z
+	
+	; save and shift high nibble (to pass it to next iteration)
 	MOV CNT, SMP
 	ANDI CNT, 0xF0
 	SWAP CNT
 	ANDI CNT, 0x0F
+
+	; take low nibble, make it high and add new digit
 	ANDI SMP, 0x0F
 	SWAP SMP
 	ANDI SMP, 0xF0
 	OR SMP, ARG
 	ST Z, SMP
+
+	; move shifted tail into ARG to use for next byte
 	MOV ARG, CNT
 	CPI ZL, LOW(SBPTR)
 	BREQ BCD_SHIFT_DONE
@@ -999,6 +1087,7 @@ BCD_SHIFT_DONE:
 	RET
 
 
+; parses ASCII-digits, converts to packed BCD and writes result to EEPROM
 ; convert int value from str to packed bcd
 PARSE_BCD_TO_EEPROM:
 	PUSH XL
@@ -1017,7 +1106,7 @@ PARSE_BCD_LOOP:
 	DEC CNT
 	BRNE PARSE_BCD_LOOP
 
-; save bcd to EEPROM
+	; save bcd to EEPROM
 PARSE_BCD_STORE:
 	POP XL
 	LDI YH, HIGH(SBPTR)
@@ -1033,6 +1122,7 @@ PARSE_BCD_STORE_LOOP:
 	RET
 
 
+; reads packed BCD from EEPROM and unpacks it into ASCII-string in SBUF
 LOAD_BCD_TO_SEND:
 	LDI YH, HIGH(SBPTR)
 	LDI YL, LOW(SBPTR)
@@ -1043,15 +1133,20 @@ LOAD_BCD_LOOP:
 	CALL EEPROM_READ_BYTE
 	INC XL
 	MOV SMP, TMP
+
+	; process high nibble (digit)
 	SWAP TMP
 	ANDI TMP, 0x0F
 	CALL BCD_DIGIT_TO_SEND
+
+	; process low nibble 
 	MOV TMP, SMP
 	ANDI TMP, 0x0F
 	CALL BCD_DIGIT_TO_SEND
 	DEC CNT
 	BRNE LOAD_BCD_LOOP
 
+	; if number == 0 (no digits), write "0"
 	TST ARG
 	BRNE LOAD_BCD_CRLF
 	LDI TMP, '0'
@@ -1065,11 +1160,13 @@ LOAD_BCD_CRLF:
 	RET
 
 
+; converts nibble to ASCII and writes to buffer, suppressing leading zeroes
+; in the beginning of number
 BCD_DIGIT_TO_SEND:
 	TST ARG
 	BRNE BCD_DIGIT_STORE
 	TST TMP
-	BREQ BCD_DIGIT_SKIP
+	BREQ BCD_DIGIT_SKIP	; suppress leading zeroes (if ARG=0 and we see 0)
 	LDI ARG, 1
 
 BCD_DIGIT_STORE:
@@ -1080,6 +1177,7 @@ BCD_DIGIT_SKIP:
 	RET
 
 
+; reads packed BCD from EEPROM and converts it to 1-byte int (0--255)
 LOAD_BCD_BYTE:
 	CLR ARG
 	LDI CNT, IVLEN
@@ -1100,6 +1198,7 @@ LOAD_BCD_BYTE_LOOP:
 	RET
 
 
+; helper function to assemble uint8_t from digits (ARG = ARG * 10 + TMP)
 BCD_BYTE_DIGIT:
 	LDI SMP, 10
 	MUL ARG, SMP
@@ -1109,6 +1208,7 @@ BCD_BYTE_DIGIT:
 	RET
 
 
+; converts 1-byte int (from TBB) to packed BCD and writes to EEPROM
 BYTE_BCD_TO_EEPROM:
 	PUSH XL
 	CALL BCD_CLEAR_SEND
@@ -1169,6 +1269,7 @@ BYTE_BCD_STORE_LOOP:
 	RET
 
 
+; formats 1-byte int (in TMP) to ASCII-string in SBUF (adds CRLF to end)
 BYTE_TO_SEND_BUF:
 	LDI YH, HIGH(SBPTR)
 	LDI YL, LOW(SBPTR)
@@ -1223,6 +1324,7 @@ BYTE_ONES:
 	RET
 
 
+; writes string "OK\r\n" to SBUF (reply for successfull save)
 ; write "ok" + CRLF to SBUF
 MAKE_OK_SEND:
 	LDI YH, HIGH(SBPTR)
@@ -1238,6 +1340,7 @@ MAKE_OK_SEND:
 	RET
 
 
+; looks for string terminator ('\0') in SBUF and replaces it with CRLF
 ; add CRLF to SBUF
 ADD_CRLF_TO_SEND_RAW:
 	LDI YH, HIGH(SBPTR)
@@ -1253,13 +1356,14 @@ ADD_CRLF_SCAN:
 
 ADD_CRLF_FOUND:
 	LDI TMP, CR
-	ST -Y, TMP	; we are currently at '\0' -> DEC Y before writing
+	ST -Y, TMP	; we are currently at '\0' --> DEC Y before writing
 	ADIW YL, 1
 	LDI TMP, LF
 	ST Y+, TMP
 	RET
 
 
+; loads string from EEPROM into Operation Buffer (OBUF)
 LOAD_STR_TO_OBUF:
 	CALL SEL_ADDR
 	LDI YH, HIGH(OBPTR)
@@ -1268,6 +1372,7 @@ LOAD_STR_TO_OBUF:
 	RJMP LOAD_STR_RAW_LOOP
 
 
+; loads string from EEPROM into Send Buffer (SBUF), saving null-terminator
 LOAD_STR_TO_SEND_RAW:
 	CALL SEL_ADDR
 	LDI YH, HIGH(SBPTR)
@@ -1289,12 +1394,14 @@ LOAD_STR_RAW_DONE:
 	RET
 
 
+; loads string from EEPROM to SBUF and appends CRLF
 LOAD_STR_TO_SEND:
 	CALL LOAD_STR_TO_SEND_RAW
 	CALL ADD_CRLF_TO_SEND_RAW
 	RET
 
 
+; checks DSTSEL. if DST is EEPROM (A/B/C) --> saves, else --> sends to UART
 STORE_OR_SEND_INT_RESULT:
 	TST DSTSEL
 	BREQ STORE_OR_SEND_SEND
@@ -1307,6 +1414,7 @@ STORE_OR_SEND_SEND:
 	RET
 
 
+; checks DSTSEL. if DST is EEPROM (x/y/z) --> saves, else --> sends to UART
 STORE_OR_SEND_STR_RESULT:
 	TST DSTSEL
 	BREQ STORE_OR_SEND_STR_SEND
@@ -1338,6 +1446,8 @@ STORE_OR_SEND_STR_SEND:
 	RET
 
 
+; parser for input command from OBUF. sets OPSEL, DSTSEL, TGTSEL and SRCSEL
+; sets Error Flag (SREF), if syntax is invalid
 ; checks SREF, parses OBUF, updates selectors
 UPD_SELS:
 	CLR OPSEL
@@ -1529,6 +1639,7 @@ UPD_SELS_OK:
 	RET
 
 
+; resets parser flag, starts send of reply to terminal and restarts UART read
 ; starts send (if needed), clears SROF, clears selectors
 OP_DONE:
 	; clear SROF
@@ -1549,6 +1660,8 @@ OP_DONE:
 	RET
 
 
+; error handler (e.g. syntax errors). outputs "ERROR" 
+; and resets to default state
 ; end operation, print error msg
 OP_FAIL:
 	; print errmsg
@@ -1571,10 +1684,14 @@ OP_FAIL:
 ; INTERRUPT HANDLERS	========================================================
 
 
+; interrupt on UART symbol receive
+; puts symbols to OBUF until CR/LF (EOL), then sets flag SROF to start parser
 ; byte received
 URXCisr:
 	ISRB
 
+	; ignore input, if controller is busy with operation parsing (SROF)
+	; ...or sending a reply (SRSF)
 	SBRC STATR, SROF
 	RJMP URXCisre
 	SBRC STATR, SRSF
@@ -1589,6 +1706,8 @@ URXCisr:
 	CPI TMP, 32
 	BRLO URXC_ERR
 
+	; check for buffer overflow. if Y (RXPTR) has reached OBPTR + OBLEN - 1
+	; ...call overflow error
 	LDS YL, RXPTR
 	LDS YH, RXPTR + 1
 	LDI SMP, LOW(OBPTR + OBLEN - 1)
@@ -1604,33 +1723,22 @@ URXC_EOL:
 	LDS YH, RXPTR + 1
 	CLR TMP
 	ST Y, TMP
-	SBR STATR, (1 << SROF)
+	SBR STATR, (1 << SROF)	; set flag --- string is ready for 
+							; ...processing in LOOP
 	RJMP URXCisre
 
 URXC_ERR:
-	SBR STATR, (1 << SREF)
+	SBR STATR, (1 << SREF)	; error, set flag SREF that will be caught in LOOP
 
 URXCisre:
 
 	ISRE
 
 
-; UDR is empty, another byte can be sent
-UDREisr:
-	ISRB
-	
-	; Sending is performed synchronously from the main loop.
-
-	ISRE
+; UDRE: Sending is performed synchronously from the main loop.
 
 
-; TWI operation complete
-TWIisr:
-	ISRB
-
-	; TWI operations are blocking; this vector is kept for completeness.
-
-	ISRE
+; TWI: TWI operations are blocking; this vector is kept for completeness.
 
 
 ; STRING CONSTANTS	============================================================
